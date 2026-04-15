@@ -54,6 +54,41 @@ extract_int64() {
     echo "$1" | grep -oP '(?:int64 )\K[-0-9]+'
 }
 
+# Telegram sometimes reports mpris:length=0 via MPRIS because it sets
+# the duration once on track start before streaming headers are parsed,
+# and never updates it. Retry a few times to let it catch up.
+MAX_LENGTH_RETRIES=10
+LENGTH_RETRY_DELAY=0.3
+
+get_length_us() {
+    local all="$1"
+    echo "$all" | grep -oP "'mpris:length': <int64 \K[0-9]+" || echo "0"
+}
+
+wait_for_length() {
+    local len_us i all
+    all=$(get_all)
+    len_us=$(get_length_us "$all")
+
+    if [ "${len_us:-0}" -gt 0 ] 2>/dev/null; then
+        echo "$len_us"
+        return 0
+    fi
+
+    for (( i=0; i<MAX_LENGTH_RETRIES; i++ )); do
+        sleep "$LENGTH_RETRY_DELAY"
+        all=$(get_all)
+        len_us=$(get_length_us "$all")
+        if [ "${len_us:-0}" -gt 0 ] 2>/dev/null; then
+            echo "$len_us"
+            return 0
+        fi
+    done
+
+    echo "0"
+    return 1
+}
+
 extract_string() {
     local key="$1" data="$2"
     echo "$data" | grep -oP "'$key': <'[^']*'>" | grep -oP "(?<=<')[^']*"
@@ -91,7 +126,10 @@ cmd_status() {
     local pos_s=$(( (pos_us + 500000) / 1000000 ))
 
     local len_us
-    len_us=$(echo "$all" | grep -oP "'mpris:length': <int64 \K[0-9]+")
+    len_us=$(get_length_us "$all")
+    if [ "${len_us:-0}" -eq 0 ] 2>/dev/null; then
+        len_us=$(wait_for_length)
+    fi
     local len_s=$(( (len_us + 500000) / 1000000 ))
 
     local title
@@ -141,8 +179,24 @@ cmd_to() {
         exit 1
     fi
 
-    set_position "$track_id" "$target_us"
-    echo "Seeked to $(format_time $target_s)"
+    local len_us
+    len_us=$(get_length_us "$all")
+    if [ "${len_us:-0}" -eq 0 ] 2>/dev/null; then
+        len_us=$(wait_for_length)
+    fi
+
+    if [ "${len_us:-0}" -eq 0 ] 2>/dev/null; then
+        # Duration still unknown — fall back to relative seek from current position
+        local pos_raw pos_us offset_us
+        pos_raw=$(get_prop Position)
+        pos_us=$(extract_int64 "$pos_raw")
+        offset_us=$((target_us - pos_us))
+        seek_relative "$offset_us"
+        echo "Seeked to ~$(format_time $target_s) (relative fallback, duration unknown)"
+    else
+        set_position "$track_id" "$target_us"
+        echo "Seeked to $(format_time $target_s)"
+    fi
 }
 
 check_running
